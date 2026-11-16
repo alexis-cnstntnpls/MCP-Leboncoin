@@ -32,6 +32,8 @@ import lbc
 from curl_cffi.requests.exceptions import RequestException
 from lbc.exceptions import DatadomeError, InvalidValue, NotFoundError, RequestError
 
+from .cookie import get_datadome_cookie
+
 T = TypeVar("T")
 
 # Les deux tris par prix sont inverses dans lbc 1.1.6 : Sort.CHEAPEST envoie
@@ -53,10 +55,10 @@ RANGE_CEILING = 999_999_999
 DEFAULT_IMPERSONATE = "chrome_android"
 
 BLOCKED_MESSAGE = (
-    "Leboncoin (Datadome) a refuse la requete. Attendre quelques minutes avant de "
-    "relancer, espacer davantage les requetes (variable LBC_MIN_INTERVAL), essayer "
-    "une autre empreinte de navigateur (variable LBC_IMPERSONATE) ou passer par un "
-    "proxy residentiel francais (variable LBC_PROXY)."
+    "Leboncoin (Datadome) a refuse la requete. Fournir un cookie valide via la variable "
+    "d'environnement LBC_DATADOME_COOKIE ou le fichier ~/.config/leboncoin/datadome.txt, "
+    "espacer davantage les requetes (variable LBC_MIN_INTERVAL) ou passer par un proxy "
+    "residentiel francais (variable LBC_PROXY)."
 )
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -365,11 +367,15 @@ class Leboncoin:
                     # Une seule relance : lbc la fait sans attendre, apres avoir
                     # recree sa session (une requete de plus). Les enchainer
                     # contre Datadome ne fait que prolonger le blocage.
-                    self._client = lbc.Client(
+                    client = lbc.Client(
                         proxy=proxy_from_env(),
                         impersonate=os.environ.get("LBC_IMPERSONATE") or DEFAULT_IMPERSONATE,
                         max_retries=1,
                     )
+                    cookie = get_datadome_cookie()
+                    if cookie and hasattr(client, "session"):
+                        client.session.cookies.set("datadome", cookie, domain=".leboncoin.fr")
+                    self._client = client
                 return action(self._client)
             except DatadomeError:
                 self._client = None  # repartir d'une session neuve la prochaine fois

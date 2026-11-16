@@ -1,4 +1,8 @@
-"""Serveur MCP : les outils Leboncoin exposes a Claude."""
+"""Serveur MCP : les outils Leboncoin exposes a Claude / ChatGPT.
+
+Inclut les outils de base (search_ads, get_ad, get_seller) ainsi que
+les outils avances de suivi (historique de prix, veille automatique et bonnes affaires).
+"""
 
 from __future__ import annotations
 
@@ -12,13 +16,13 @@ from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
+from .database import Database
 from .formatting import ad_to_dict, price_stats, seller_to_dict, write_export
-from .leboncoin import Criteria, Leboncoin, LeboncoinError, prepare_search
+from .leboncoin import Criteria, Leboncoin, LeboncoinError, parse_ad_id, prepare_search
 
 T = TypeVar("T")
 
-# Construits depuis lbc pour suivre ses mises a jour : Claude voit la liste
-# exacte des valeurs admises dans le schema de l'outil.
+# Construits depuis lbc pour suivre ses mises a jour
 CategoryName = Literal[tuple(category.name for category in lbc.Category)]  # type: ignore[valid-type]
 RegionName = Literal[tuple(region.name for region in lbc.Region)]  # type: ignore[valid-type]
 
@@ -26,27 +30,25 @@ RegionName = Literal[tuple(region.name for region in lbc.Region)]  # type: ignor
 MAX_INLINE_RESULTS = 300
 
 INSTRUCTIONS = """\
-Recherche d'annonces Leboncoin (France), via la bibliotheque Python lbc.
+Recherche d'annonces Leboncoin (France) avec suivi des prix et veille automatique.
 
-- search_ads cherche des annonces ; get_ad donne le detail d'une annonce ;
-  get_seller le profil et la note d'un vendeur.
-- Pour un filtre que search_ads n'expose pas directement, le plus sur est de
-  demander a l'utilisateur l'URL d'une recherche faite sur leboncoin.fr et de
-  la passer dans `url` : elle est reproduite a l'identique.
-- Les requetes sont espacees (2 s par defaut) : Leboncoin bloque temporairement
-  l'adresse IP (Datadome) apres une rafale. Eviter les appels inutiles, et pour
-  un gros volume utiliser `pages` avec `export_format` plutot que d'enchainer
-  les appels.
+- search_ads : recherche d'annonces avec filtres, tri et pagination.
+- get_ad : fiche detaillee d'une annonce et son historique de prix.
+- get_seller : informations et avis d'un vendeur.
+- get_price_history : historique des variations de prix d'une annonce.
+- get_recent_deals : meilleures baisses de prix et opportunites recentes.
+- add_watchlist / list_watchlist : gestion de la veille automatique en arriere-plan.
 """
 
 mcp = MCPServer(name="leboncoin", instructions=INSTRUCTIONS)
 gateway = Leboncoin()
+db = Database()
 
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 
 async def _run(function: Callable[..., T], *args: Any) -> T:
-    """Execute un appel lbc (bloquant) hors de la boucle d'evenements."""
+    """Execute un appel bloquant hors de la boucle d'evenements."""
     try:
         return await anyio.to_thread.run_sync(function, *args)
     except LeboncoinError as exc:
@@ -94,18 +96,14 @@ async def search_ads(
         dict[str, dict[str, int | None] | list[str | int | None]] | None,
         Field(
             description="Filtres avances, par cle d'API Leboncoin. Intervalle : [min, max] ou "
-            "{'min': x, 'max': y}, une borne pouvant etre null. Enumeration : liste de codes "
-            "texte. Exemples : {'square': [40, 80], 'rooms': [3, null], "
-            "'real_estate_type': ['1', '2']} (1 maison, 2 appartement), "
-            "{'mileage': [null, 100000], 'regdate': [2016, null]}. Les cles des attributs "
-            "renvoyes avec chaque annonce sont des cles de filtre valides."
+            "{'min': x, 'max': y}, une borne pouvant etre null. Enumeration : liste de codes texte."
         ),
     ] = None,
     url: Annotated[
         str | None,
         Field(
             description="URL d'une recherche faite sur leboncoin.fr. Si fournie, elle remplace "
-            "tous les autres criteres (seuls limit, page, pages et export_format comptent)."
+            "tous les autres criteres."
         ),
     ] = None,
     limit: Annotated[int, Field(ge=1, le=100, description="Annonces par page.")] = 35,
@@ -116,20 +114,13 @@ async def search_ads(
     ] = 1,
     export_format: Annotated[
         Literal["csv", "json"] | None,
-        Field(
-            description="Ecrit toutes les annonces trouvees dans un fichier (description "
-            "complete comprise) et ne renvoie qu'un resume et un echantillon. Indispensable "
-            f"au-dela de {MAX_INLINE_RESULTS} annonces."
-        ),
+        Field(description="Ecrit toutes les annonces trouvees dans un fichier export."),
     ] = None,
 ) -> dict[str, Any]:
     """Recherche des annonces sur Leboncoin.
-
-    Renvoie les totaux du site, des statistiques de prix sur les annonces
-    recuperees et, pour chacune : id, titre, prix, date, lieu, categorie, URL
-    et attributs utiles (etat, kilometrage, surface...). next_page indique la
-    page a demander pour continuer. Pour le detail d'une annonce (description,
-    photos, vendeur), utiliser get_ad.
+    
+    Enregistre automatiquement les annonces dans la base de donnees locale pour
+    historiser les prix et reperer les futures baisses de prix.
     """
     if export_format is None and limit * pages > MAX_INLINE_RESULTS:
         raise ToolError(
@@ -162,6 +153,7 @@ async def search_ads(
     seen: set[int] = set()
     first_result: lbc.Search | None = None
     next_page: int | None = start
+
     for current in range(start, start + pages):
         try:
             result = await _run(gateway.search_page, prepared, limit, current)
@@ -171,11 +163,15 @@ async def search_ads(
             notes.append(f"Arret a la page {current} : {exc}")
             break
         first_result = first_result or result
-        # Les annonces glissent d'une page a l'autre quand de nouvelles arrivent.
         for ad in result.ads:
             if ad.id not in seen:
                 seen.add(ad.id)
                 ads.append(ad)
+                try:
+                    db.record_ad(ad_to_dict(ad, full=True))
+                except Exception:
+                    pass
+
         next_page = current + 1
         if pages > 1:
             await ctx.report_progress(current - start + 1, pages, f"{len(ads)} annonces")
@@ -196,13 +192,23 @@ async def search_ads(
     if notes:
         response["notes"] = notes
 
+    formatted_ads = []
+    for ad in ads:
+        d = ad_to_dict(ad)
+        hist = db.get_price_history(ad.id)
+        if hist and hist.get("price_drop_pct", 0) > 0:
+            d["price_drop_pct"] = hist["price_drop_pct"]
+            d["first_price"] = hist["first_price"]
+        formatted_ads.append(d)
+
     if export_format:
         label = query or (category if category != "TOUTES_CATEGORIES" else "recherche")
         path = await anyio.to_thread.run_sync(write_export, ads, export_format, label)
         response["export_file"] = str(path)
-        response["sample"] = [ad_to_dict(ad) for ad in ads[:5]]
+        response["sample"] = formatted_ads[:5]
     else:
-        response["ads"] = [ad_to_dict(ad) for ad in ads]
+        response["ads"] = formatted_ads
+
     return response
 
 
@@ -210,9 +216,23 @@ async def search_ads(
 async def get_ad(
     ad: Annotated[str, Field(description="Identifiant numerique ou URL de l'annonce.")],
 ) -> dict[str, Any]:
-    """Detail complet d'une annonce : description, photos, tous les attributs,
-    coordonnees, nombre de favoris et identifiant du vendeur (seller_id)."""
-    return ad_to_dict(await _run(gateway.get_ad, ad), full=True)
+    """Detail complet d'une annonce : description, photos, attributs,
+    vendeur et historique des prix enregistres."""
+    ad_obj = await _run(gateway.get_ad, ad)
+    data = ad_to_dict(ad_obj, full=True)
+    try:
+        db.record_ad(data)
+    except Exception:
+        pass
+
+    hist = db.get_price_history(data["id"])
+    if hist:
+        data["price_history"] = hist["history"]
+        data["min_price"] = hist["min_price"]
+        data["max_price"] = hist["max_price"]
+        data["price_drop_pct"] = hist["price_drop_pct"]
+
+    return data
 
 
 @mcp.tool(title="Profil d'un vendeur Leboncoin", annotations=READ_ONLY)
@@ -222,14 +242,86 @@ async def get_seller(
         Field(description="seller_id renvoye par get_ad, ou identifiant/URL d'une annonce du vendeur."),
     ],
 ) -> dict[str, Any]:
-    """Profil d'un vendeur : anciennete, note sur 5 et nombre d'avis, taux et
-    delai de reponse, nombre d'annonces en ligne, et pour un professionnel sa
-    boutique (SIRET, adresse, site web)."""
+    """Profil d'un vendeur : anciennete, note sur 5, avis, delai de reponse
+    et annonces en ligne."""
     user, ad = await _run(gateway.get_seller, seller)
     data = seller_to_dict(user)
     if ad is not None:
         data["from_ad"] = {"id": ad.id, "title": ad.subject}
     return data
+
+
+@mcp.tool(title="Historique de prix d'une annonce", annotations=READ_ONLY)
+async def get_price_history(
+    ad: Annotated[str, Field(description="Identifiant numerique ou URL de l'annonce.")],
+) -> dict[str, Any]:
+    """Consulte l'historique des prix enregistres pour une annonce Leboncoin."""
+    ad_id = parse_ad_id(ad)
+    hist = await anyio.to_thread.run_sync(db.get_price_history, ad_id)
+    if not hist:
+        try:
+            ad_obj = await _run(gateway.get_ad, ad_id)
+            db.record_ad(ad_to_dict(ad_obj, full=True))
+            hist = await anyio.to_thread.run_sync(db.get_price_history, ad_id)
+        except Exception:
+            pass
+
+    if not hist:
+        raise ToolError(f"Aucun historique enregistre pour l'annonce {ad_id}.")
+    return hist
+
+
+@mcp.tool(title="Bonnes affaires et baisses de prix", annotations=READ_ONLY)
+async def get_recent_deals(
+    min_drop_pct: Annotated[float, Field(ge=0, description="Pourcentage minimal de baisse de prix.")] = 5.0,
+    limit: Annotated[int, Field(ge=1, le=50, description="Nombre maximal d'annonces a renvoyer.")] = 20,
+) -> dict[str, Any]:
+    """Renvoie les annonces ayant connu les plus fortes baisses de prix enregistrees en base."""
+    deals = await anyio.to_thread.run_sync(db.get_recent_deals, limit, min_drop_pct)
+    return {"count": len(deals), "deals": deals}
+
+
+@mcp.tool(title="Ajouter une recherche en veille automatique")
+async def add_watchlist(
+    name: Annotated[str, Field(description="Nom descriptif de la recherche a surveiller.")],
+    query: Annotated[str | None, Field(description="Mots-cles a surveiller.")] = None,
+    category: Annotated[CategoryName, Field(description="Categorie.")] = "TOUTES_CATEGORIES",
+    price_min: Annotated[int | None, Field(description="Prix minimum.")] = None,
+    price_max: Annotated[int | None, Field(description="Prix maximum.")] = None,
+    city: Annotated[str | None, Field(description="Ville.")] = None,
+    radius_km: Annotated[float, Field(description="Rayon en km.")] = 10.0,
+    departments: Annotated[list[str] | None, Field(description="Departements.")] = None,
+    shippable_only: Annotated[bool, Field(description="Livraison uniquement.")] = False,
+    interval_seconds: Annotated[int, Field(ge=60, le=86400, description="Intervalle entre scans en secondes.")] = 300,
+) -> dict[str, Any]:
+    """Ajoute une recherche a la veille automatique en arriere-plan (detection de nouvelles annonces et baisses de prix)."""
+    w_id = await anyio.to_thread.run_sync(
+        db.add_watchlist,
+        name,
+        query,
+        category,
+        price_min,
+        price_max,
+        city,
+        radius_km,
+        departments,
+        shippable_only,
+        interval_seconds,
+    )
+    return {
+        "status": "added",
+        "watchlist_id": w_id,
+        "name": name,
+        "query": query,
+        "interval_seconds": interval_seconds,
+    }
+
+
+@mcp.tool(title="Lister les recherches surveillees", annotations=READ_ONLY)
+async def list_watchlist() -> dict[str, Any]:
+    """Liste toutes les recherches activement surveillees en arriere-plan."""
+    items = await anyio.to_thread.run_sync(db.list_watchlist, True)
+    return {"count": len(items), "watchlist": items}
 
 
 def main() -> None:

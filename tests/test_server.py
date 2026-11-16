@@ -33,7 +33,8 @@ def fake_page(ids, max_pages=10):
 
 async def test_tools_are_listed_with_lbc_choices():
     tools = {tool.name: tool for tool in await server.mcp.list_tools()}
-    assert set(tools) == {"search_ads", "get_ad", "get_seller"}
+    assert {"search_ads", "get_ad", "get_seller"}.issubset(set(tools))
+    assert {"get_price_history", "get_recent_deals", "add_watchlist", "list_watchlist"}.issubset(set(tools))
     schema = tools["search_ads"].input_schema
     assert "ELECTRONIQUE_CONSOLES" in str(schema["properties"]["category"])
     assert "ctx" not in schema["properties"]
