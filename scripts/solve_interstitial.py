@@ -42,9 +42,14 @@ client = lbc.Client(impersonate='chrome_android', max_retries=0)
 cookie = open('/var/lib/leboncoin-mcp/datadome.txt').read().strip() if os.path.exists('/var/lib/leboncoin-mcp/datadome.txt') else ''
 if cookie:
     client.session.cookies.set('datadome', cookie, domain='.leboncoin.fr')
-r = client.session.post('https://api.leboncoin.fr/finder/search', json={'filters': {'keywords': {'text': 'test'}}})
-print('STATUS:', r.status_code)
-if r.status_code != 200:
+try:
+    res = client.search(text='test', limit=1)
+    print('STATUS: 200')
+    print('COUNT:', len(res.ads))
+except Exception as e:
+    print('STATUS: 403')
+    from lbc.utils import build_search_payload_with_args
+    r = client.session.post('https://api.leboncoin.fr/finder/search', json=build_search_payload_with_args(text='test', limit=1))
     print('BODY:', r.text)
 """
     b64 = base64.b64encode(remote_code.strip().encode("utf-8")).decode("utf-8")
@@ -122,10 +127,15 @@ async def solve_with_patchright(url: str, socks_port: int = LOCAL_SOCKS_PORT) ->
         print("[*] Resolution du Device Check en cours...")
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            for _ in range(16):
+            # Attendre la reception du cookie
+            for _ in range(20):
                 if solved_cookie:
                     break
                 await asyncio.sleep(0.5)
+            # Laisser le temps a la redirection finale window.location.replace(json.url) de s'executer
+            if solved_cookie:
+                print("[*] Attente de la finalisation du redirect vers leboncoin...")
+                await asyncio.sleep(4)
         except Exception as e:
             print(f"[-] Navigation : {e}")
 

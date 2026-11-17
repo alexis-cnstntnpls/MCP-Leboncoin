@@ -419,10 +419,185 @@ class Leboncoin:
             finally:
                 self._last_request = time.monotonic()
 
+    def _build_ssr_url(self, kwargs: dict[str, Any], page: int = 1) -> str:
+        """Construit l'URL de recherche web Next.js SSR a partir des arguments prepares."""
+        if "url" in kwargs and kwargs["url"]:
+            base_url = kwargs["url"]
+            if page > 1:
+                sep = "&" if "?" in base_url else "?"
+                return f"{base_url}{sep}page={page}"
+            return base_url
+
+        params: dict[str, str] = {}
+        if kwargs.get("text"):
+            params["text"] = str(kwargs["text"])
+
+        cat = kwargs.get("category")
+        if cat and hasattr(cat, "value") and str(cat.value) != "0":
+            params["category"] = str(cat.value)
+
+        if page > 1:
+            params["page"] = str(page)
+
+        if kwargs.get("shippable"):
+            params["shippable"] = "1"
+
+        if kwargs.get("search_in_title_only"):
+            params["search_in_title_only"] = "1"
+
+        owner = kwargs.get("owner_type")
+        if owner and hasattr(owner, "value"):
+            params["owner_type"] = str(owner.value)
+
+        sort = kwargs.get("sort")
+        if sort and hasattr(sort, "value"):
+            val = sort.value
+            if val == ("price", "asc"):
+                params["sort"] = "price"
+            elif val == ("price", "desc"):
+                params["sort"] = "price"
+                params["order"] = "desc"
+            elif val == ("time", "desc"):
+                params["sort"] = "time"
+            elif val == ("time", "asc"):
+                params["sort"] = "time"
+                params["order"] = "asc"
+
+        price = kwargs.get("price")
+        if isinstance(price, (list, tuple)) and len(price) == 2:
+            p_min_str = str(price[0]) if price[0] is not None and price[0] > 0 else ""
+            p_max_str = str(price[1]) if price[1] is not None and price[1] < 999_999_999 else ""
+            if p_min_str or p_max_str:
+                params["price"] = f"{p_min_str}-{p_max_str}"
+        elif isinstance(price, dict):
+            p_min = price.get("min")
+            p_max = price.get("max")
+            p_min_str = str(p_min) if p_min is not None and p_min > 0 else ""
+            p_max_str = str(p_max) if p_max is not None and p_max < 999_999_999 else ""
+            if p_min_str or p_max_str:
+                params["price"] = f"{p_min_str}-{p_max_str}"
+
+        locs = kwargs.get("locations")
+        if locs and isinstance(locs, list):
+            loc_tokens = []
+            for loc in locs:
+                if hasattr(loc, "id") and hasattr(loc, "department_code"):
+                    loc_tokens.append(f"d_{loc.id}")
+                elif hasattr(loc, "id") and hasattr(loc, "name"):
+                    loc_tokens.append(f"r_{loc.id}")
+                elif hasattr(loc, "lat") and hasattr(loc, "lng"):
+                    radius = getattr(loc, "radius", 10000)
+                    city_name = getattr(loc, "city", "city")
+                    loc_tokens.append(f"{city_name}__{loc.lat}_{loc.lng}_{radius}")
+            if loc_tokens:
+                params["locations"] = ",".join(loc_tokens)
+
+        return f"https://www.leboncoin.fr/recherche?{urllib.parse.urlencode(params)}"
+
+    def _fetch_ssr_search(self, url: str) -> lbc.Search | None:
+        """Collecte les annonces via le rendu Next.js SSR (__NEXT_DATA__)."""
+        from curl_cffi import requests as cffi_requests
+        proxy_cfg = proxy_from_env()
+        proxies = {"http": proxy_cfg.url, "https": proxy_cfg.url} if proxy_cfg else None
+
+        s = cffi_requests.Session(impersonate="chrome")
+        if proxies:
+            s.proxies = proxies
+
+        r = s.get(url, timeout=20)
+        if r.status_code == 200:
+            m = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r.text)
+            if m:
+                raw_data = json.loads(m.group(1))
+                search_data = raw_data.get("props", {}).get("pageProps", {}).get("searchData", {})
+                if search_data and "ads" in search_data:
+                    return lbc.Search._build(raw=search_data, client=self._client)
+        return None
+
+    def _fetch_ssr_ad(self, ad_ref: str | int) -> lbc.Ad | None:
+        """Recupere la fiche detaillee d'une annonce via le rendu Next.js SSR."""
+        from curl_cffi import requests as cffi_requests
+        proxy_cfg = proxy_from_env()
+        proxies = {"http": proxy_cfg.url, "https": proxy_cfg.url} if proxy_cfg else None
+
+        s = cffi_requests.Session(impersonate="chrome")
+        if proxies:
+            s.proxies = proxies
+
+        url_str = str(ad_ref).strip()
+        if "leboncoin.fr/ad/" in url_str:
+            target_url = url_str
+        else:
+            r1 = s.get(f"https://www.leboncoin.fr/recherche?text={url_str}", timeout=20)
+            if r1.status_code != 200:
+                return None
+            m1 = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r1.text)
+            if not m1:
+                return None
+            sd = json.loads(m1.group(1)).get("props", {}).get("pageProps", {}).get("searchData", {})
+            ads = sd.get("ads", [])
+            if not ads:
+                return None
+            target_url = ads[0].get("url")
+            if not target_url:
+                return None
+
+        r2 = s.get(target_url, timeout=20)
+        if r2.status_code == 200:
+            m2 = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', r2.text)
+            if m2:
+                raw_ad = json.loads(m2.group(1)).get("props", {}).get("pageProps", {}).get("ad", {})
+                if raw_ad:
+                    return lbc.Ad._build(raw=raw_ad, client=self._client)
+        elif r2.status_code in (404, 410):
+            raise NotFoundError("Annonce introuvable ou retiree.")
+        return None
+
     def search_page(self, prepared: PreparedSearch, limit: int, page: int) -> lbc.Search:
+        with self._lock:
+            target_delay = random.uniform(self.min_delay, self.max_delay)
+            wait = self._last_request + target_delay - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            if self.min_delay > 0:
+                time.sleep(random.uniform(0.1, 0.4))
+
+            # 1. Tenter la collecte directe via SSR Next.js (sans dependance cookie DataDome)
+            try:
+                ssr_url = self._build_ssr_url(prepared.kwargs, page=page)
+                res = self._fetch_ssr_search(ssr_url)
+                if res is not None:
+                    if limit < len(res.ads):
+                        res.ads = res.ads[:limit]
+                    self._last_request = time.monotonic()
+                    return res
+            except Exception:
+                pass
+
+        # 2. Fallback sur le client d'API lbc
         return self._call(lambda client: client.search(**prepared.kwargs, limit=limit, page=page))
 
     def get_ad(self, ad: str | int) -> lbc.Ad:
+        with self._lock:
+            target_delay = random.uniform(self.min_delay, self.max_delay)
+            wait = self._last_request + target_delay - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            if self.min_delay > 0:
+                time.sleep(random.uniform(0.1, 0.4))
+
+            # 1. Tenter la fiche annonce via SSR Next.js
+            try:
+                ad_obj = self._fetch_ssr_ad(ad)
+                if ad_obj is not None:
+                    self._last_request = time.monotonic()
+                    return ad_obj
+            except NotFoundError:
+                raise LeboncoinError("Introuvable : annonce retiree ou identifiant errone.") from None
+            except Exception:
+                pass
+
+        # 2. Fallback sur le client d'API lbc
         ad_id = parse_ad_id(ad)
         return self._call(lambda client: client.get_ad(ad_id))
 
