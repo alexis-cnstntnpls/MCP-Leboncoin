@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import threading
 import time
@@ -347,37 +348,63 @@ def proxy_from_env() -> lbc.Proxy | None:
 
 
 class Leboncoin:
-    """Client lbc partage, dont les requetes sont espacees et serialisees."""
+    """Client lbc partage, dont les requetes sont espacees, randomisees et serialisees."""
 
     def __init__(self, min_interval: float | None = None):
-        if min_interval is None:
-            min_interval = float(os.environ.get("LBC_MIN_INTERVAL", "2"))
-        self.min_interval = min_interval
+        # Delais par defaut : comportement humain randomise entre 3.5s et 7.5s
+        self.min_delay = float(os.environ.get("LBC_MIN_DELAY", "3.5"))
+        self.max_delay = float(os.environ.get("LBC_MAX_DELAY", "7.5"))
+        if min_interval is not None:
+            self.min_delay = min_interval
+            self.max_delay = max(min_interval, min_interval * 1.5)
         self._client: lbc.Client | None = None
+        self._current_cookie: str | None = None
         self._lock = threading.Lock()
         self._last_request = 0.0
 
     def _call(self, action: Callable[[lbc.Client], T]) -> T:
         with self._lock:
-            wait = self._last_request + self.min_interval - time.monotonic()
+            # Randomisation humaine de l'attente entre deux requetes
+            target_delay = random.uniform(self.min_delay, self.max_delay)
+            wait = self._last_request + target_delay - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
+            # Micro-jitter humain supplementaire
+            if self.min_delay > 0:
+                time.sleep(random.uniform(0.1, 0.4))
+
+            # Verification et rechargement dynamique du cookie si modifie sur disque
+            fresh_cookie = get_datadome_cookie()
+
             try:
                 if self._client is None:
-                    # Une seule relance : lbc la fait sans attendre, apres avoir
-                    # recree sa session (une requete de plus). Les enchainer
-                    # contre Datadome ne fait que prolonger le blocage.
                     client = lbc.Client(
                         proxy=proxy_from_env(),
                         impersonate=os.environ.get("LBC_IMPERSONATE") or DEFAULT_IMPERSONATE,
-                        max_retries=1,
+                        max_retries=0,
                     )
-                    cookie = get_datadome_cookie()
-                    if cookie and hasattr(client, "session"):
-                        client.session.cookies.set("datadome", cookie, domain=".leboncoin.fr")
+                    if fresh_cookie and hasattr(client, "session"):
+                        client.session.cookies.set("datadome", fresh_cookie, domain=".leboncoin.fr")
                     self._client = client
+                    self._current_cookie = fresh_cookie
+                elif fresh_cookie and fresh_cookie != self._current_cookie and hasattr(self._client, "session"):
+                    # Hot-reload du cookie sans redemarrer le client
+                    self._client.session.cookies.set("datadome", fresh_cookie, domain=".leboncoin.fr")
+                    self._current_cookie = fresh_cookie
+
                 return action(self._client)
+
             except DatadomeError:
+                # Tenter un rechargement immediat du cookie depuis le disque/env
+                latest_cookie = get_datadome_cookie()
+                if latest_cookie and latest_cookie != self._current_cookie and self._client and hasattr(self._client, "session"):
+                    self._client.session.cookies.set("datadome", latest_cookie, domain=".leboncoin.fr")
+                    self._current_cookie = latest_cookie
+                    try:
+                        return action(self._client)
+                    except DatadomeError:
+                        pass
+
                 self._client = None  # repartir d'une session neuve la prochaine fois
                 raise LeboncoinError(BLOCKED_MESSAGE) from None
             except NotFoundError:

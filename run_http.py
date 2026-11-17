@@ -29,8 +29,8 @@ logger = logging.getLogger("leboncoin-mcp")
 
 
 def start_background_collector():
-    """Demarre la boucle de surveillance en arriere-plan."""
-    if os.environ.get("ENABLE_MONITOR", "1").strip() not in ("1", "true", "True"):
+    """Demarre la boucle de surveillance en arriere-plan (desactivee par defaut pour preserver la session)."""
+    if os.environ.get("ENABLE_MONITOR", "0").strip() not in ("1", "true", "True"):
         logger.info("Veille automatique en arriere-plan desactivee (ENABLE_MONITOR=0)")
         return
 
@@ -61,7 +61,7 @@ def main():
     security_settings = TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
         allowed_hosts=allowed_hosts,
-        allowed_origins=["*"],
+        allowed_origins=["https://chatgpt.com", "https://claude.ai", "https://mcp-lbc.duckdns.org", "*"],
     )
 
     # Lancement du daemon de veille

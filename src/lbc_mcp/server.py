@@ -44,15 +44,19 @@ mcp = MCPServer(name="leboncoin", instructions=INSTRUCTIONS)
 gateway = Leboncoin()
 db = Database()
 
+# Verrou FIFO strict : une seule requete Leboncoin traitee a la fois tous agents confondus
+REQUEST_QUEUE_LOCK = anyio.Lock()
+
 READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
 
 
 async def _run(function: Callable[..., T], *args: Any) -> T:
-    """Execute un appel bloquant hors de la boucle d'evenements."""
-    try:
-        return await anyio.to_thread.run_sync(function, *args)
-    except LeboncoinError as exc:
-        raise ToolError(str(exc)) from None
+    """Execute un appel bloquant hors de la boucle d'evenements, serialise en file d'attente FIFO."""
+    async with REQUEST_QUEUE_LOCK:
+        try:
+            return await anyio.to_thread.run_sync(function, *args)
+        except LeboncoinError as exc:
+            raise ToolError(str(exc)) from None
 
 
 @mcp.tool(title="Rechercher des annonces Leboncoin", annotations=READ_ONLY)
@@ -195,10 +199,13 @@ async def search_ads(
     formatted_ads = []
     for ad in ads:
         d = ad_to_dict(ad)
-        hist = db.get_price_history(ad.id)
-        if hist and hist.get("price_drop_pct", 0) > 0:
-            d["price_drop_pct"] = hist["price_drop_pct"]
-            d["first_price"] = hist["first_price"]
+        try:
+            hist = db.get_price_history(ad.id)
+            if hist and hist.get("price_drop_pct", 0) > 0:
+                d["price_drop_pct"] = hist["price_drop_pct"]
+                d["first_price"] = hist["first_price"]
+        except Exception:
+            pass
         formatted_ads.append(d)
 
     if export_format:

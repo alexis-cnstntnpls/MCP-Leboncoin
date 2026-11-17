@@ -106,7 +106,11 @@ def get_datadome_cookie() -> str | None:
 
     # 2. Fichier configure ou standard
     cookie_file_path = os.environ.get("LBC_COOKIE_FILE", "").strip()
-    candidate_paths = [Path(cookie_file_path)] if cookie_file_path else [DEFAULT_COOKIE_FILE]
+    candidate_paths = [Path(cookie_file_path)] if cookie_file_path else [
+        DEFAULT_COOKIE_FILE,
+        Path("/var/lib/leboncoin-mcp/datadome.txt"),
+        Path.home() / ".config" / "leboncoin" / "cookie.txt",
+    ]
 
     for p in candidate_paths:
         if p.is_file():
