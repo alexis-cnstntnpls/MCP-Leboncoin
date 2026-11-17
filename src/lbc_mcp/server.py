@@ -7,6 +7,7 @@ les outils avances de suivi (historique de prix, veille automatique et bonnes af
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from typing import Annotated, Any, Literal, TypeVar
 
 import anyio.to_thread
@@ -29,7 +30,17 @@ RegionName = Literal[tuple(region.name for region in lbc.Region)]  # type: ignor
 # Au-dela, la reponse ne tient plus confortablement dans le contexte de Claude.
 MAX_INLINE_RESULTS = 300
 
-INSTRUCTIONS = """\
+# Chargement de la skill de recherche méthodologique Leboncoin (v4.0.0)
+SKILL_PATH = Path(__file__).parent / "SKILL.md"
+if SKILL_PATH.exists():
+    _raw_skill = SKILL_PATH.read_text(encoding="utf-8")
+    if _raw_skill.startswith("---"):
+        _parts = _raw_skill.split("---", 2)
+        SKILL_TEXT = _parts[2].strip() if len(_parts) >= 3 else _raw_skill
+    else:
+        SKILL_TEXT = _raw_skill
+else:
+    SKILL_TEXT = """\
 Recherche d'annonces Leboncoin (France) avec suivi des prix et veille automatique.
 
 - search_ads : recherche d'annonces avec filtres, tri et pagination.
@@ -39,6 +50,8 @@ Recherche d'annonces Leboncoin (France) avec suivi des prix et veille automatiqu
 - get_recent_deals : meilleures baisses de prix et opportunites recentes.
 - add_watchlist / list_watchlist : gestion de la veille automatique en arriere-plan.
 """
+
+INSTRUCTIONS = SKILL_TEXT
 
 mcp = MCPServer(name="leboncoin", instructions=INSTRUCTIONS)
 gateway = Leboncoin()
@@ -329,6 +342,48 @@ async def list_watchlist() -> dict[str, Any]:
     """Liste toutes les recherches activement surveillees en arriere-plan."""
     items = await anyio.to_thread.run_sync(db.list_watchlist, True)
     return {"count": len(items), "watchlist": items}
+
+
+# ---------------------------------------------------------------------------
+# Skill Leboncoin Research v4.0.0 (Ressource documentaire & Prompt guidé)
+# ---------------------------------------------------------------------------
+
+@mcp.resource("leboncoin://skill/research-guide", name="Guide Méthodologique Leboncoin Research v4.0.0")
+def get_research_skill_guide() -> str:
+    """Fournit le texte intégral de la skill de recherche et évaluation méthodologique Leboncoin v4.0.0."""
+    return SKILL_TEXT
+
+
+@mcp.prompt(
+    name="leboncoin_research",
+    title="Recherche & Évaluation Approfondie Leboncoin v4.0.0",
+    description="Active la méthodologie complète : critères obligatoires/souhaitables, recherche multi-passes, vérification transaction_status, détection annonces fantômes, audit vendeur et calcul du coût complet."
+)
+def leboncoin_research_prompt(
+    besoin: Annotated[str, Field(description="Besoin précis, modèle ou produit recherché sur Leboncoin")],
+    budget_max: Annotated[str | None, Field(description="Budget plafond en euros (€) si applicable")] = None,
+    ville_ou_zone: Annotated[str | None, Field(description="Commune, département ou région")] = None,
+) -> str:
+    """Génère la directive de prompt initiale pour exécuter la skill Leboncoin Research."""
+    prompt_lines = [
+        f"Exécute une mission de recherche Leboncoin complète selon la méthodologie Leboncoin Research pour : '{besoin}'.",
+    ]
+    if budget_max:
+        prompt_lines.append(f"- Budget plafond : {budget_max}")
+    if ville_ou_zone:
+        prompt_lines.append(f"- Emplacement / Zone : {ville_ou_zone}")
+    prompt_lines.extend([
+        "",
+        "Consignes méthodologiques obligatoires :",
+        "1. Identifier les critères obligatoires vs souhaitables.",
+        "2. Recherche multi-passes avec search_ads (Passe A directe, Passe B synonymes/marques, Passe C usages/équivalences, Passe E récentes).",
+        "3. Dédupliquer les résultats par identifiant réel d'annonce.",
+        "4. Appeler get_ad sur les candidats : inspecter transaction_status (exclure 'Vendu' et 'Achat en cours'), dates, favoris et logistique.",
+        "5. Appeler get_seller sur les finalistes : date d'inscription, activité récente, avis et réputation.",
+        "6. Calculer le coût complet (prix + port + accessoires indispensables).",
+        "7. Restituer le classement : Statut A (vérifiable et prioritaire), B (plausible mais à confirmer), C (risquée) avec les liens directs et les questions clés à poser au vendeur.",
+    ])
+    return "\n".join(prompt_lines)
 
 
 def main() -> None:
