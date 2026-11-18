@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Point d'entree Streamable HTTP pour le serveur MCP Leboncoin et le moteur de veille.
+"""Point d'entrée Streamable HTTP pour le serveur MCP Leboncoin et le moteur de veille.
 
 Ce script :
 1. Lance le transport MCP Streamable HTTP pour ChatGPT / Claude
-2. Lance le daemon de veille en arriere-plan (CollectorService) si active (ENABLE_MONITOR=1 par defaut)
-3. Configure la securite reseau (TransportSecuritySettings) pour accepter le host public Caddy (ex: mcp-lbc.duckdns.org)
+2. Lance le daemon de veille en arrière-plan (CollectorService) si activé (ENABLE_MONITOR=1)
+3. Configure la sécurité réseau (TransportSecuritySettings) pour accepter les reverse-proxies
 """
 
 import logging
@@ -29,13 +29,13 @@ logger = logging.getLogger("leboncoin-mcp")
 
 
 def start_background_collector():
-    """Demarre la boucle de surveillance en arriere-plan (desactivee par defaut pour preserver la session)."""
+    """Démarre la boucle de surveillance en arrière-plan si activée."""
     if os.environ.get("ENABLE_MONITOR", "0").strip() not in ("1", "true", "True"):
-        logger.info("Veille automatique en arriere-plan desactivee (ENABLE_MONITOR=0)")
+        logger.info("Veille automatique en arrière-plan désactivée (ENABLE_MONITOR=0)")
         return
 
     interval = int(os.environ.get("MONITOR_INTERVAL_SECONDS", "300"))
-    logger.info("Lancement de la veille automatique en arriere-plan (intervalle: %d s)...", interval)
+    logger.info("Lancement de la veille automatique en arrière-plan (intervalle: %d s)...", interval)
 
     collector = CollectorService()
     t = threading.Thread(target=collector.start_loop, args=(interval,), daemon=True, name="LBC-Collector")
@@ -45,9 +45,9 @@ def start_background_collector():
 def main():
     host = os.environ.get("MCP_HOST", "127.0.0.1")
     port = int(os.environ.get("MCP_PORT", "8000"))
+    path = os.environ.get("MCP_PATH", "/mcp")
+    public_host = os.environ.get("MCP_PUBLIC_HOST", "localhost")
 
-    # Securite reseau : autoriser les domaines externes (Caddy reverse proxy / DuckDNS)
-    public_host = os.environ.get("MCP_PUBLIC_HOST", "mcp-lbc.duckdns.org")
     allowed_hosts = [
         "127.0.0.1",
         "127.0.0.1:*",
@@ -55,26 +55,26 @@ def main():
         "localhost:*",
         public_host,
         f"{public_host}:*",
-        "*"
+        "*",
     ]
 
     security_settings = TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
         allowed_hosts=allowed_hosts,
-        allowed_origins=["https://chatgpt.com", "https://claude.ai", "https://mcp-lbc.duckdns.org", "*"],
+        allowed_origins=["https://chatgpt.com", "https://claude.ai", "*"],
     )
 
     # Lancement du daemon de veille
     start_background_collector()
 
-    logger.info("Demarrage du serveur MCP Streamable HTTP sur http://%s:%d/mcp", host, port)
-    logger.info("Host public autorise : %s", public_host)
+    logger.info("Démarrage du serveur MCP Streamable HTTP sur http://%s:%d%s", host, port, path)
+    logger.info("Host public autorisé : %s", public_host)
 
     mcp.run(
         transport="streamable-http",
         host=host,
         port=port,
-        streamable_http_path="/mcp",
+        streamable_http_path=path,
         transport_security=security_settings,
     )
 

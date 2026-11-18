@@ -1,110 +1,253 @@
-# lbc-mcp
+# Leboncoin MCP Server (France)
 
-Serveur [MCP](https://modelcontextprotocol.io) qui permet à Claude de chercher des annonces Leboncoin : recherche multi-critères, pages enchaînées, export CSV/JSON, détail d'une annonce et profil du vendeur.
+Serveur [MCP (Model Context Protocol)](https://modelcontextprotocol.io) complet et résilient pour **Leboncoin France**, conçu pour être connecté à **Claude Desktop**, **Cursor**, **Cline**, **Claude Code** ou **ChatGPT** (via Streamable HTTP).
 
-Tout l'accès à Leboncoin repose sur [lbc](https://github.com/etienne-hd/lbc) d'etienne-hd, qui interroge l'API mobile du site. Ce serveur se contente d'exposer lbc à Claude, en y ajoutant ce qui manque pour un usage conversationnel : localisation par nom de ville, filtres tolérants, pagination, espacement des requêtes, export.
+Ce serveur ne se contente pas de chercher des annonces : il intègre un **moteur de veille autonome**, un **suivi d'historique des prix en base SQLite**, un **collecteur hybride (API + Next.js SSR)** pour résister aux protections anti-bot, ainsi qu'une **méthodologie experte de recherche et d'audit d'annonces (Skill v4.0.0)**.
 
-## Les outils
+---
 
-| Outil | Rôle |
-|---|---|
-| `search_ads` | Recherche par mots-clés, catégorie, ville + rayon, départements, régions, prix, type de vendeur, livraison, filtres avancés (surface, kilométrage, année…), ou directement à partir d'une URL de recherche leboncoin.fr. Récupère jusqu'à 50 pages d'un coup et peut tout écrire dans un fichier CSV ou JSON. |
-| `get_ad` | Détail complet d'une annonce (description, photos, attributs, favoris) à partir de son identifiant ou de son URL. |
-| `get_seller` | Profil d'un vendeur : note, nombre d'avis, ancienneté, taux de réponse et, pour un professionnel, sa boutique (SIRET, adresse, site). |
+## Sommaire
 
-Quelques demandes qu'on peut faire à Claude une fois le serveur branché :
+- [Fonctionnalités clés](#-fonctionnalités-clés)
+- [Catalogue des Outils MCP](#-catalogue-des-outils-mcp)
+- [Prompts et Ressources MCP](#-prompts-et-ressources-mcp)
+- [Architecture & Résilience Anti-Bot (DataDome)](#-architecture--résilience-anti-bot-datadome)
+- [Prérequis & Installation](#-prérequis--installation)
+- [Modes d'Exécution & Configuration](#-modes-dexécution--configuration)
+  - [1. Mode local standard : stdio (Claude Desktop / Cursor)](#1-mode-local-standard--stdio-claude-desktop--cursor)
+  - [2. Mode serveur HTTP : Streamable HTTP / SSE (ChatGPT / Accès distant)](#2-mode-serveur-http--streamable-http--sse-chatgpt--accès-distant)
+- [Variables d'Environnement](#-variables-denvironnement)
+- [Tests & Validation](#-tests--validation)
+- [Bibliothèques & Références](#-bibliothèques--références)
+- [Licence & Avertissement](#-licence--avertissement)
 
-- « Trouve des Nintendo Switch OLED à moins de 200 € autour de Lyon, particuliers seulement, les plus récentes d'abord. »
-- « Exporte en CSV toutes les annonces de Clio 4 diesel de moins de 100 000 km en Gironde et donne-moi le prix médian. »
-- « Voici une recherche que j'ai faite sur le site : https://www.leboncoin.fr/recherche?… Récupère les 5 premières pages et repère les meilleures affaires. »
-- « Le vendeur de cette annonce est-il fiable ? https://www.leboncoin.fr/ad/… »
+---
 
-## Installation
+## 🌟 Fonctionnalités clés
 
-Il faut Python 3.10 ou plus récent.
+1. **Recherche Multi-Critères Avancée :**
+   - Recherche par mots-clés, filtres de prix min/max, catégories, types de vendeur (particulier/pro), livraison activée.
+   - Géolocalisation intelligente : résolution de communes françaises (`"Lyon"`, `"69003"`, `"Saint-Denis (974)"`) avec rayon en km via l'API officielle `geo.api.gouv.fr`.
+   - Réplication directe d'une recherche depuis une URL du site `leboncoin.fr`.
+   - Export en masse (jusqu'à des centaines d'annonces) au format CSV (compatible Excel FR) ou JSON.
+
+2. **Historisation Automatique des Prix :**
+   - Chaque annonce consultée ou recherchée est enregistrée dans une base de données locale SQLite.
+   - Détection des baisses de prix, du prix d'origine et calcul des pourcentages de réduction au fil du temps.
+
+3. **Moteur de Veille en Arrière-Plan (Watchlist) :**
+   - Possibilité d'enregistrer des recherches récurrentes surveillées par un démon en tâche de fond.
+   - Alertes automatiques en cas de nouvelle annonce détectée ou de baisse de prix.
+
+4. **Résilience Anti-Bot Avancée :**
+   - Collecte hybride : interroge l'API mobile ou bascule de façon transparente sur le rendu web **Next.js SSR (`__NEXT_DATA__`)** capable d'extraire les données sans session complexe.
+   - Gestion et injection de cookie DataDome (`datadome.txt` ou variable d'environnement).
+   - File d'attente FIFO sérialisée avec temporisation aléatoire pour respecter les limites de débit.
+
+5. **Skill Méthodologique Intégrée (v4.0.0) :**
+   - Instructions système guidant l'IA pour exclure les annonces déjà vendues ou avec achat en cours (`transaction_status`), repérer les annonces fantômes (croisement favoris / ancienneté), auditer la réputation du vendeur et calculer le coût complet (prix + port + accessoires).
+
+---
+
+## 🛠 Catalogue des Outils MCP
+
+| Outil | Description |
+| :--- | :--- |
+| **`search_ads`** | Recherche d'annonces avec filtres complets (texte, URL de recherche, catégorie, ville + rayon, départements, régions, tri, prix min/max, livraison, type de vendeur). Enregistre automatiquement les résultats dans la base SQLite locale pour historiser les prix. |
+| **`get_ad`** | Fiche détaillée d'une annonce (titre, prix, description complète, photos HD, statut de transaction, géolocalisation, vendeur et historique de prix enregistré). |
+| **`get_seller`** | Profil d'un vendeur (nom, type de compte particulier/pro, note sur 5, nombre d'avis vérifiés, date d'inscription et nombre d'annonces en ligne). |
+| **`get_price_history`** | Historique chronologique complet des variations de prix d'une annonce enregistrée dans la base locale (prix initial, prix minimum, baisse en pourcentage). |
+| **`get_recent_deals`** | Liste les meilleures baisses de prix récemment observées en base (filtrables par pourcentage minimal de baisse). |
+| **`add_watchlist`** | Ajoute une recherche à la veille automatique périodique en arrière-plan. |
+| **`list_watchlist`** | Liste toutes les veilles actuellement actives avec leurs paramètres et intervalles de scan. |
+
+---
+
+## 💡 Prompts et Ressources MCP
+
+En plus des outils, le serveur expose les primitives natives du protocole MCP :
+
+- **Prompt MCP : `leboncoin_research`**
+  - Permet à l'IA d'exécuter une recherche guidée en plusieurs passes (termes exacts, synonymes, équivalences d'usage, opportunités récentes) selon la méthodologie d'évaluation v4.0.0.
+  - Arguments : `besoin`, `budget_max` (optionnel), `ville_ou_zone` (optionnel).
+- **Ressource MCP : `leboncoin://skill/research-guide`**
+  - Fournit le texte intégral de la méthodologie d'audit et de qualification d'annonces Leboncoin consultable directement par les agents IA.
+
+---
+
+## 🛡 Architecture & Résilience Anti-Bot (DataDome)
+
+Leboncoin est protégé par la solution anti-bot DataDome. Ce serveur intègre plusieurs lignes de défense :
+
+1. **Empreinte TLS / JA3 (via `curl_cffi`) :**
+   - Les requêtes HTTP imitent fidèlement les navigateurs modernes (`chrome_android` ou `chrome131`) pour éviter le rejet immédiat au niveau handshake TLS.
+2. **Collecteur Autonome Next.js SSR :**
+   - En cas d'inaccessibilité de l'API mobile, le moteur tente d'extraire les données directement depuis le flux Next.js Server-Side Rendering (`<script id="__NEXT_DATA__">`) de la page web, permettant une récupération propre sans dépendance de jetons applicatifs complexes.
+3. **Persistance de session / Cookie DataDome :**
+   - Si un cookie `datadome` est requis, le serveur peut le lire automatiquement depuis la variable `LBC_DATADOME_COOKIE`, un fichier `datadome.txt`, ou le trousseau local d'un navigateur sur la machine hôte.
+4. **File d'attente FIFO & Débit contrôlé :**
+   - Toutes les requêtes sortantes passent par un verrou sérialisé `REQUEST_QUEUE_LOCK` avec un délai paramétrable (`LBC_MIN_DELAY` / `LBC_MAX_DELAY`) pour éviter tout bannissement d'IP lié aux rafales concurrentes.
+
+---
+
+## 📦 Prérequis & Installation
+
+- **Python :** Version 3.10 ou supérieure.
+- **Système d'exploitation :** Linux, macOS ou Windows.
+
+### Installation pas à pas
 
 ```bash
-git clone https://github.com/BPiroga/lbc-mcp.git
-cd lbc-mcp
-python -m venv .venv
-.venv\Scripts\python -m pip install -e .
+# 1. Cloner le dépôt
+git clone https://github.com/votre-compte/MCP-Leboncoin.git
+cd MCP-Leboncoin
+
+# 2. Créer l'environnement virtuel Python
+python3 -m venv .venv
+
+# 3. Activer l'environnement virtuel
+# Sur Linux / macOS :
+source .venv/bin/activate
+# Sur Windows :
+# .venv\Scripts\activate
+
+# 4. Installer les dépendances en mode éditable
+pip install --upgrade pip
+pip install -e .
 ```
 
-(Sous macOS ou Linux, remplacer `.venv\Scripts\python` par `.venv/bin/python`.)
+---
 
-### Brancher le serveur sur Claude Desktop
+## 🚀 Modes d'Exécution & Configuration
 
-Ouvrir `%APPDATA%\Claude\claude_desktop_config.json` (menu Paramètres → Développeur → Modifier la configuration) et ajouter le serveur, avec le chemin réel du dossier :
+### 1. Mode local standard : stdio (Claude Desktop / Cursor)
+
+C'est le mode le plus simple pour exécuter le serveur localement sur votre ordinateur personnel.
+
+#### Configuration pour Claude Desktop
+
+Ouvrez le fichier de configuration de Claude Desktop :
+- **macOS :** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows :** `%APPDATA%\Claude\claude_desktop_config.json`
+- **Linux :** `~/.config/Claude/claude_desktop_config.json`
+
+Ajoutez la section suivante (adaptez le chemin absolu vers votre dossier) :
 
 ```json
 {
   "mcpServers": {
     "leboncoin": {
-      "command": "C:\\Users\\<vous>\\lbc-mcp\\.venv\\Scripts\\python.exe",
+      "command": "/chemin/absolu/vers/MCP-Leboncoin/.venv/bin/python",
       "args": ["-m", "lbc_mcp"]
     }
   }
 }
 ```
 
-Puis redémarrer Claude Desktop.
+Redémarrez ensuite Claude Desktop. Le marteau d'outils Leboncoin apparaîtra dans l'interface.
 
-### Brancher le serveur sur Claude Code
-
-```bash
-claude mcp add leboncoin -- C:\Users\<vous>\lbc-mcp\.venv\Scripts\python.exe -m lbc_mcp
-```
-
-### Sans cloner le dépôt, avec uv
+#### Configuration pour Claude Code (CLI)
 
 ```bash
-uvx --from git+https://github.com/BPiroga/lbc-mcp lbc-mcp
+claude mcp add leboncoin -- /chemin/absolu/vers/MCP-Leboncoin/.venv/bin/python -m lbc_mcp
 ```
 
-## Réglages
+---
 
-Tous facultatifs, à passer en variables d'environnement (clé `"env"` dans la configuration de Claude Desktop).
+### 2. Mode serveur HTTP : Streamable HTTP / SSE (ChatGPT / Accès distant)
 
-| Variable | Défaut | Effet |
-|---|---|---|
-| `LBC_MIN_INTERVAL` | `2` | Secondes minimales entre deux requêtes à Leboncoin. |
-| `LBC_PROXY` | aucun | Proxy à utiliser, forme `http://utilisateur:motdepasse@hote:port`. |
-| `LBC_IMPERSONATE` | `chrome_android` | Navigateur dont lbc imite l'empreinte TLS (voir ci-dessous). |
-| `LBC_EXPORT_DIR` | `Téléchargements\leboncoin` | Dossier des exports CSV/JSON. |
-
-## Gros volumes et blocages
-
-Leboncoin est protégé par Datadome, qui trie d'abord les clients d'après leur empreinte TLS. lbc en choisit une au hasard parmi quatre navigateurs ; lors des essais (septembre 2026), seule `chrome_android` passait (8 fois sur 8), les trois autres étant refusées dès la première requête. Utilisé tel quel, lbc échoue donc environ trois fois sur quatre. Le serveur fixe `chrome_android` par défaut ; si Datadome change de règles, `LBC_IMPERSONATE` permet d'en essayer une autre (`chrome`, `edge`, `safari`, `safari_ios`, `firefox`…).
-
-Le débit toléré, lui, n'est pas connu. Par prudence, le serveur espace ses requêtes d'au moins deux secondes, et s'il est bloqué au milieu d'une récupération de plusieurs pages, il rend ce qu'il a déjà obtenu au lieu de tout perdre.
-
-Pour de gros volumes :
-
-- demander un export (`export_format`) plutôt que d'afficher les annonces dans la conversation : 100 annonces par page, jusqu'à la limite de pagination du site (environ 3 500 annonces par recherche) ;
-- augmenter `LBC_MIN_INTERVAL` si les blocages se répètent ;
-- passer par un proxy résidentiel situé en France (`LBC_PROXY`), comme le recommande lbc.
-
-## Particularités
-
-- **Villes.** lbc attend des coordonnées GPS. Le serveur les obtient auprès de l'API publique [geo.api.gouv.fr](https://geo.api.gouv.fr) : on peut donner un nom de commune, un code postal, ou `Saint-Denis (974)` pour lever une homonymie.
-- **Départements.** Les listes de lbc couvrent la métropole hors Corse ; pour la Corse et l'outre-mer, il faut passer par les régions.
-- **Export CSV.** Séparateur point-virgule, UTF-8 avec BOM et virgule décimale : le fichier s'ouvre directement dans Excel en français, accents et nombres compris.
-- **Tri par prix.** Dans lbc 1.1.6, `Sort.CHEAPEST` et `Sort.EXPENSIVE` sont inversés. Le serveur choisit le tri d'après sa valeur réelle (`price`/`asc` ou `desc`), ce qui restera juste quand lbc sera corrigé.
-- **URL de recherche.** Le serveur décode l'URL et remet ses paramètres dans un ordre que lbc accepte, avant de la lui passer. Le paramètre `page` de l'URL est respecté.
-
-## Développement
+Pour connecter le serveur à **ChatGPT** (menu *Plugins / Serveurs MCP*) ou pour l'exécuter sur une machine distante derrière un reverse-proxy HTTPS (Caddy, Nginx) :
 
 ```bash
-.venv\Scripts\python -m pip install -e ".[dev]"
-.venv\Scripts\python -m pytest
+python run_http.py
 ```
 
-Les tests n'interrogent pas Leboncoin. Pour un essai réel de bout en bout (quelques requêtes, espacées) : `.venv\Scripts\python scripts\smoke_test.py`.
+Par défaut, le serveur écoute sur `http://127.0.0.1:8000/mcp`.
 
-## Avertissement
+#### Exemple de service systemd (Linux)
 
-Projet personnel, sans lien avec Leboncoin. Il interroge une API non documentée qui peut changer à tout moment ; l'usage doit rester raisonnable et conforme aux conditions d'utilisation du site.
+Pour un fonctionnement permanent en tâche de fond :
 
-## Licence
+```ini
+[Unit]
+Description=Serveur MCP Leboncoin
+After=network.target
 
-MIT. lbc est également sous licence MIT.
+[Service]
+Type=simple
+User=votre_utilisateur
+WorkingDirectory=/chemin/vers/MCP-Leboncoin
+Environment="MCP_HOST=127.0.0.1"
+Environment="MCP_PORT=8000"
+Environment="MCP_PATH=/mcp"
+Environment="MCP_PUBLIC_HOST=localhost"
+Environment="ENABLE_MONITOR=0"
+ExecStart=/chemin/vers/MCP-Leboncoin/.venv/bin/python /chemin/vers/MCP-Leboncoin/run_http.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## ⚙️ Variables d'Environnement
+
+Toutes les variables sont optionnelles et disposent de valeurs par défaut saines :
+
+| Variable | Défaut | Description |
+| :--- | :--- | :--- |
+| `MCP_HOST` | `127.0.0.1` | Adresse IP d'écoute pour le mode HTTP. |
+| `MCP_PORT` | `8000` | Port d'écoute pour le mode HTTP. |
+| `MCP_PATH` | `/mcp` | Préfixe du chemin HTTP (ex: `/mcp` ou `/mcp/leboncoin`). |
+| `MCP_PUBLIC_HOST` | `localhost` | Nom d'hôte public attendu dans les en-têtes HTTP (utile derrière reverse-proxy). |
+| `LBC_DB_PATH` | `~/.local/share/leboncoin/leboncoin.db` | Emplacement du fichier de base de données SQLite. |
+| `LBC_COOKIE_FILE` | `~/.config/leboncoin/datadome.txt` | Fichier contenant un cookie DataDome valide. |
+| `LBC_DATADOME_COOKIE` | *(aucun)* | Valeur directe d'un cookie DataDome valide. |
+| `LBC_IMPERSONATE` | `chrome_android` | Empreinte navigateur TLS (`chrome_android`, `chrome131`, `safari`, etc.). |
+| `LBC_MIN_DELAY` | `2.0` | Délai minimal aléatoire (en secondes) entre deux requêtes. |
+| `LBC_MAX_DELAY` | `5.0` | Délai maximal aléatoire (en secondes) entre deux requêtes. |
+| `LBC_PROXY` | *(aucun)* | Proxy HTTP/SOCKS à utiliser (`http://user:pass@host:port` ou `socks5://...`). |
+| `ENABLE_MONITOR` | `0` | Passer à `1` pour démarrer le démon de veille automatique en arrière-plan. |
+| `MONITOR_INTERVAL_SECONDS` | `300` | Intervalle de scrutation de la veille (en secondes). |
+| `LBC_EXPORT_DIR` | `~/Downloads/leboncoin` | Dossier par défaut des exports de recherche CSV/JSON. |
+
+---
+
+## 🧪 Tests & Validation
+
+### Lancer la suite de tests unitaires
+
+```bash
+python -m pytest
+```
+
+*(Les tests unitaires utilisent des bouchons et n'émettent pas de requêtes réelles vers Leboncoin).*
+
+### Lancer le test d'intégration de bout en bout (Smoke Test)
+
+```bash
+python scripts/smoke_test.py
+```
+
+Ce script démarre le serveur MCP en sous-processus `stdio` et exécute un cycle de recherche réel pour vérifier l'accès réseau et la validité des parsers.
+
+---
+
+## 📚 Bibliothèques & Références
+
+Ce projet s'appuie sur d'excellentes bibliothèques open-source :
+
+- **[Model Context Protocol SDK (`mcp`)](https://github.com/modelcontextprotocol/python-sdk)** : SDK officiel Anthropic pour l'implémentation de serveurs et clients MCP.
+- **[lbc](https://github.com/etienne-hd/lbc)** par *@etienne-hd* : Client Python non officiel pour l'API Leboncoin.
+- **[leboncoin-mcp](https://github.com/BPiroga/leboncoin-mcp)** par *@BPiroga* : Projet initial ayant inspiré cette version améliorée.
+- **[curl_cffi](https://github.com/yifeikong/curl_cffi)** : Bibliothèque Python avec bindings libcurl et support natif de l'usurpation d'empreinte TLS / JA3 / JA4.
+- **[geo.api.gouv.fr](https://geo.api.gouv.fr)** : API ouverte du gouvernement français pour le géocodage des communes et départements.
+
+---
+
+## ⚖️ Licence & Avertissement
+
+- Ce projet est publié sous **Licence MIT**.
+- **Avertissement légal :** Ce logiciel est un projet indépendant et n'a aucun lien d'affiliation avec la société *Leboncoin*. Il utilise des interfaces non documentées susceptibles d'évoluer. Son utilisation doit être réalisée dans le respect des conditions générales d'utilisation de la plateforme.
